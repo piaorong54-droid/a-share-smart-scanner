@@ -6,7 +6,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from provider import Provider
+from public_feed import PublicProvider, evaluate
 from strategy import eligible, number, sepa, yang
 
 CN = timezone(timedelta(hours=8))
@@ -22,67 +22,8 @@ def minutes_until(now):
     return result
 
 
-def evidence(p, stock, days, now, mode):
-    symbol = stock["ts_code"]
-    today = now.strftime("%Y%m%d")
-    def fetch(api, fields, **params):
-        return p.rows(api, fields, ts_code=symbol, **params)
-    bounds = dict(start_date=days[0], end_date=days[-1])
-    bars = fetch("daily", "trade_date,close,high,vol", **bounds)
-    bars.sort(key=lambda d: d["trade_date"])
-    if [d["trade_date"] for d in bars] != days:
-        raise ValueError("日线缺失或停牌")
-    factors = {r["trade_date"]: number(r["adj_factor"]) for r in fetch("adj_factor", "trade_date,adj_factor", start_date=days[0], end_date=today)}
-    for d in bars:
-        factor = factors[d["trade_date"]] / factors[today]
-        d.update(adjusted_close=number(d["close"])*factor, adjusted_high=number(d["high"])*factor, volume=d["vol"])
-    rows = fetch("stk_mins", "trade_time,close,vol,amount,high,low", freq="1min",
-                 start_date=now.strftime("%Y-%m-%d 09:30:00"), end_date=now.strftime("%Y-%m-%d %H:%M:00"))
-    rows.sort(key=lambda r: r["trade_time"])
-    expected = minutes_until(now)
-    if not rows or any(r["trade_time"][:10] != now.date().isoformat() for r in rows):
-        raise ValueError("缺少当日分钟数据")
-    mins = [dict(minute=r["trade_time"][11:16], close=r["close"], shares=r["vol"], amount_yuan=r["amount"]) for r in rows]
-    if [m["minute"] for m in mins] != expected:
-        raise ValueError("STALE / 当日分钟覆盖不全")
-    price = number(rows[-1]["close"])
-    checks = {}
-    detail = dict(price=price, market_time=rows[-1]["trade_time"])
-    if mode in ("yang","combined"):
-        limits = {r["trade_date"]:r["up_limit"] for r in fetch("stk_limit","trade_date,up_limit",start_date=days[-20],end_date=days[-1])}
-        for d in bars[-20:]:
-            d["limit_up"] = number(d["close"]) == number(limits[d["trade_date"]])
-        # Official same-day reference close and float shares must be available.
-        refs = fetch("daily","trade_date,pre_close",trade_date=today)
-        shares = fetch("daily_basic","trade_date,float_share",trade_date=today)
-        prev = number(refs[0]["pre_close"])
-        floating = number(shares[0]["float_share"])*10000
-        volume = sum(number(m["shares"]) for m in mins)
-        q = dict(price=price, rise_pct=(price/prev-1)*100, turnover_pct=100*volume/floating,
-                 float_cap_yi=price*floating/1e8, expected_minutes=expected,
-                 volume_ratio=volume*240/len(mins)/(sum(number(d["vol"]) for d in bars[-5:])*100/5),
-                 amplitude_pct=(max(number(r["high"]) for r in rows)-min(number(r["low"]) for r in rows))/prev*100)
-        checks.update(yang(q,bars[-20:],mins))
-        detail.update({k:v for k,v in q.items() if k!="expected_minutes"})
-    if mode in ("sepa","combined"):
-        # Single-quarter figures and audited annual profits only; date-only disclosures available next day.
-        fin = fetch("fina_indicator","ann_date,end_date,q_sales_yoy,q_profit_yoy,q_profit_qoq,roe")
-        financial = sorted((r for r in fin if r["ann_date"] and r["ann_date"] < today),key=lambda r:(r["end_date"],r["ann_date"]))
-        latest = financial[-1]
-        annual = next(r for r in reversed(financial) if r["end_date"].endswith("1231"))
-        income = fetch("income","ann_date,end_date,n_income_attr_p,report_type",report_type="1")
-        profits = {r["end_date"]:r["n_income_attr_p"] for r in sorted(income,key=lambda r:r["ann_date"] or "") if r["ann_date"] and r["ann_date"] < today and str(r["report_type"])=="1"}
-        end = annual["end_date"]
-        f = dict(disclosed_at=latest["ann_date"],listing_days=(now.date()-datetime.strptime(stock["list_date"],"%Y%m%d").date()).days,
-                 quarter_revenue_yoy=latest["q_sales_yoy"], quarter_profit_yoy=latest["q_profit_yoy"],quarter_profit_qoq=latest["q_profit_qoq"],
-                 annual_roe=annual["roe"],annual_profit=profits[end],annual_profit_3y_ago=profits[str(int(end[:4])-3)+"1231"])
-        checks.update(sepa(price,bars,f,today))
-        detail["financial"]=f
-    return dict(**stock, **detail, checks=checks)
-
-
-def run(mode, now, provider=Provider):
-    r = dict(id=str(uuid.uuid4()),date=now.date().isoformat(),started=now.isoformat(),mode=mode,source="Tushare Pro",
+def run(mode, now, provider=PublicProvider):
+    r = dict(id=str(uuid.uuid4()),date=now.date().isoformat(),started=now.isoformat(),mode=mode,source="深交所交易日历、东方财富主板行情及财报、腾讯日线与分时",
              sha=os.getenv("GITHUB_SHA"),status="FAILED",total=0,verified=0,matches=[],errors=[],stages=Counter(),details=[])
     try:
         p = provider()
@@ -104,7 +45,7 @@ def run(mode, now, provider=Provider):
             r["total"]=len(universe)
             for stock in universe:
                 try:
-                    item=evidence(p,stock,days,now,mode)
+                    item=evaluate(stock,days,now,mode,minutes_until(now))
                     r["details"].append(item)
                     r["verified"]+=1
                     for key,passed in item["checks"].items():
